@@ -1,87 +1,103 @@
-// Endpoint zdrowia do testu cache hit
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok' });
-});
-// server.js
-
 import express from 'express';
 import cors from 'cors';
 import { v4 as uuidv4 } from 'uuid';
-import fs from 'fs';
+import pkg from 'pg';
+import redis from 'redis';
+import dotenv from 'dotenv';
 
+dotenv.config();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-
-const DATA_FILE = '/data/items.json';
-function loadItems() {
-  try {
-    return JSON.parse(fs.readFileSync(DATA_FILE, 'utf-8'));
-  } catch {
-    return [];
-  }
-}
-function saveItems(items) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(items, null, 2));
-}
-
-let items = loadItems();
 const instanceId = process.env.INSTANCE_ID || uuidv4();
+const POSTGRES_USER = process.env.POSTGRES_USER || 'products';
+const POSTGRES_PASSWORD = process.env.POSTGRES_PASSWORD || '';
+const POSTGRES_DB = process.env.POSTGRES_DB || 'products';
+const POSTGRES_HOST = process.env.POSTGRES_HOST || 'db';
+const POSTGRES_PORT = process.env.POSTGRES_PORT || 5432;
+const REDIS_HOST = process.env.REDIS_HOST || 'cache';
+const REDIS_PORT = process.env.REDIS_PORT || 6379;
+const APP_PORT = process.env.APP_PORT || 80;
 
-
-
-// GET /items
-app.get('/items', (req, res) => {
-  items = loadItems();
-  res.json(items);
+const { Pool } = pkg;
+const pool = new Pool({
+  user: POSTGRES_USER,
+  host: POSTGRES_HOST,
+  database: POSTGRES_DB,
+  password: POSTGRES_PASSWORD,
+  port: POSTGRES_PORT,
 });
 
+const redisClient = redis.createClient({
+  url: `redis://${REDIS_HOST}:${REDIS_PORT}`
+});
+let cacheHits = 0;
+redisClient.connect().catch(console.error);
 
+// Health endpoint
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok' });
+});
 
-// POST /items
-app.post('/items', (req, res) => {
-  const { name, price, manufacturer, category, description } = req.body;
-  if (name && price && manufacturer && category) {
-    items.push({ name, price, manufacturer, category, description });
-    saveItems(items);
+// GET /api/items
+app.get('/api/items', async (req, res) => {
+  try {
+    const cacheKey = 'items';
+    const cached = await redisClient.get(cacheKey);
+    if (cached) {
+      cacheHits++;
+      return res.json(JSON.parse(cached));
+    }
+    const { rows } = await pool.query('SELECT id, name, price FROM products ORDER BY id');
+    await redisClient.set(cacheKey, JSON.stringify(rows), { EX: 30 });
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/items
+app.post('/api/items', async (req, res) => {
+  const { name, price } = req.body;
+  if (!name || !price) {
+    return res.status(400).json({ error: 'Wymagane pola: name, price' });
+  }
+  try {
+    await pool.query('INSERT INTO products (name, price) VALUES ($1, $2)', [name, price]);
+    await redisClient.del('items'); // Invalidate cache
     res.status(201).json({ ok: true });
-  } else {
-    res.status(400).json({ error: 'Wszystkie pola są wymagane: nazwa, cena, producent, kategoria' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Usuwanie produktu po indeksie (id = index w tablicy)
-app.delete('/items/:id', (req, res) => {
-  const idx = parseInt(req.params.id, 10);
-  if (!isNaN(idx) && idx >= 0 && idx < items.length) {
-    items.splice(idx, 1);
-    res.json({ ok: true });
-  } else {
-    res.status(404).json({ error: 'Nie znaleziono produktu' });
+// GET /api/stats
+app.get('/api/stats', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT COUNT(*) FROM products');
+    res.json({
+      count: parseInt(rows[0].count, 10),
+      cache_hits: cacheHits,
+      instanceId
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
+// Ensure table exists
+async function ensureTable() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS products (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    price NUMERIC(10,2) NOT NULL DEFAULT 0
+  )`);
+}
+ensureTable();
 
-// GET /stats
-app.get('/stats', (req, res) => {
-  const count = items.length;
-  const manufacturers = [...new Set(items.map(i => i.manufacturer))];
-  const categories = [...new Set(items.map(i => i.category))];
-  const avgPrice = count > 0 ? (items.reduce((sum, i) => sum + parseFloat(i.price), 0) / count).toFixed(2) : 0;
-  res.json({
-    count,
-    instanceId,
-    manufacturers,
-    categories,
-    avgPrice
-  });
-});
-
-
-// Listen on port from ENV or 3000
-const port = process.env.PORT || 3000;
+const port = APP_PORT;
 app.listen(port, () => {
   if (process.env.NODE_ENV !== 'production') {
     console.log(`Backend listening on port ${port}`);
