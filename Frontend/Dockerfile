@@ -15,3 +15,4 @@ COPY --from=builder /app/*.html /usr/share/nginx/html/
 COPY --from=builder /app/*.js /usr/share/nginx/html/
 COPY --from=builder /app/*.css /usr/share/nginx/html/
 COPY --from=builder /app/nginx.conf /etc/nginx/nginx.conf
+RUN rm -f /etc/nginx/conf.d/default.conf
