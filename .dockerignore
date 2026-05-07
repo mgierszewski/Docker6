@@ -1,0 +1,5 @@
+# Backend .dockerignore
+node_modules
+.git
+*.log
+.env

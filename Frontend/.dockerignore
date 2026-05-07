@@ -1,0 +1,5 @@
+# Frontend .dockerignore
+node_modules
+.git
+*.log
+.env
